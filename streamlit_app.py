@@ -163,17 +163,30 @@ if csv_choice == "Upload CSV":
 
 build = st.button("🔨 Build / Reset Index", type="primary")
 if build:
-    if csv_choice == "Use sample schema":
-        st.error("Please upload a CSV file. (Later you can set default to clean_data.csv)")
-    elif uploaded_df is None or uploaded_df.empty:
-        st.error("Please upload a CSV file first.")
-    else:
-        with st.spinner("Building index... (CLIP embeddings)"):
-            index, metas = build_index(uploaded_df, limit=limit,
-                                       device=None if device=="auto" else "cpu")
-            st.session_state["INDEX"] = index
-            st.session_state["METAS"] = metas
-        st.success(f"Index built: {len(metas)} documents")
+    if csv_choice == "Use repo dataset (data/clean_data.csv.gz)":
+        try:
+            with st.spinner("Loading repo dataset and building index..."):
+                df_repo = pd.read_csv("data/clean_data.csv.gz")  # <-- 압축 CSV 자동 인식
+                index, metas = build_index(df_repo, limit=limit,
+                                           device=None if device=="auto" else "cpu")
+                st.session_state["INDEX"] = index
+                st.session_state["METAS"] = metas
+            st.success(f"Index built from repo dataset: {len(metas)} documents")
+        except FileNotFoundError:
+            st.error("`data/clean_data.csv.gz` not found. Make sure the file exists in the repo.")
+        except Exception as e:
+            st.error(f"Failed to load repo dataset: {e}")
+
+    else:  # "Upload CSV"
+        if uploaded_df is None or uploaded_df.empty:
+            st.error("Please upload a CSV file first.")
+        else:
+            with st.spinner("Building index from uploaded CSV... (CLIP embeddings)"):
+                index, metas = build_index(uploaded_df, limit=limit,
+                                           device=None if device=="auto" else "cpu")
+                st.session_state["INDEX"] = index
+                st.session_state["METAS"] = metas
+            st.success(f"Index built: {len(metas)} documents")
 
 st.divider()
 qcol, icol = st.columns([2,1])
