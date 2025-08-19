@@ -143,11 +143,7 @@ st.set_page_config(page_title="Multimodal RAG Chatbot", page_icon="🛍️", lay
 st.title("🛍️ Multimodal RAG Chatbot (MVP)")
 
 st.sidebar.header("Settings")
-csv_choice = st.sidebar.selectbox(
-    "Data Source",
-    ["Upload CSV", "Use repo dataset (data/clean_data.csv.gz)"],
-    index=1
-)
+csv_choice = st.sidebar.selectbox("Data Source", ["Upload CSV", "Use sample schema"], index=0)
 limit = st.sidebar.number_input("Number of samples to index", 50, 5000, 500, step=50)
 topk = st.sidebar.slider("Top-K results", 1, 10, 5)
 device = st.sidebar.selectbox("Embedding Device", ["auto","cpu"], index=0)
