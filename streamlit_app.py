@@ -8,19 +8,56 @@ import streamlit as st
 
 # --- Runtime deps ---
 try:
-    import faiss                   # pip install faiss-cpu
-except Exception as e:
+    import faiss  # pip install faiss-cpu
+except Exception:
+    st.error("FAISS is required. Please add `faiss-cpu` to requirements.txt.")
     st.stop()
 
 from sentence_transformers import SentenceTransformer
 
 EMB_MODEL = "clip-ViT-B-32"
 EMB_DIM = 512
+REQUEST_TIMEOUT = 7
+MAX_ROWS = 8000  # hard cap for Streamlit Cloud memory
 
+REQUIRED_COLS = ["title", "brand", "price", "features", "description", "image_url"]
+ALIASES = {
+    "product_title": "title",
+    "name": "title",
+    "img_url": "image_url",
+    "images": "image_url",
+    "feature": "features",
+    "text": "description",
+}
+
+# ----------------- Caching -----------------
 @st.cache_resource
 def load_clip(device: Optional[str] = None):
     # device=None -> auto
     return SentenceTransformer(EMB_MODEL, device=device)
+
+# schema fixer
+def coerce_schema(df: pd.DataFrame) -> pd.DataFrame:
+    # rename common aliases -> canonical names
+    for old, new in ALIASES.items():
+        if old in df.columns and new not in df.columns:
+            df = df.rename(columns={old: new})
+    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    if missing:
+        st.warning(
+            f"Missing columns {missing}. The app will still work with available columns, "
+            "but retrieval quality may be lower."
+        )
+    return df
+
+def read_any_csv(file) -> pd.DataFrame:
+    """Accepts .csv or .csv.gz (compression inferred)."""
+    name = getattr(file, "name", "")
+    if isinstance(file, str) and not name:
+        name = file
+    if name.endswith(".gz"):
+        return pd.read_csv(file, compression="infer")
+    return pd.read_csv(file)
 
 # Cache index and metadata
 @st.cache_resource(show_spinner=False)
@@ -30,44 +67,40 @@ def build_index(df: pd.DataFrame,
                 limit: Optional[int]=None,
                 device: Optional[str]=None):
     model = load_clip(device)
-    idx = faiss.IndexFlatIP(EMB_DIM)  # cosine similarity via L2-normalized vectors
-    normed = True
+    idx = faiss.IndexFlatIP(EMB_DIM)  # cosine via L2-normalized vectors
     metas: List[Dict[str,Any]] = []
     vectors = []
 
-    def _emb_text(text: str) -> np.ndarray:
-        return model.encode([text], normalize_embeddings=normed).astype("float32")
-
-    def _emb_img(img: Image.Image) -> np.ndarray:
-        return model.encode([img], normalize_embeddings=normed).astype("float32")
-
+    # limit rows for memory
     if limit:
         df = df.head(limit)
 
+    # ---- batch encode texts for speed
+    texts: List[str] = []
+    rows: List[pd.Series] = []
     for _, row in df.iterrows():
-        meta = row.to_dict()
         parts = [str(row[c]) for c in text_cols if c in df.columns and pd.notna(row[c])]
-        text = " | ".join(parts) if parts else ""
-        vec = None
+        texts.append(" | ".join(parts) if parts else "")
+        rows.append(row)
+
+    text_vecs = model.encode(texts, normalize_embeddings=True, batch_size=64).astype("float32")
+
+    for i, row in enumerate(rows):
+        meta = row.to_dict()
+        vec = text_vecs[i:i+1]  # default to text vector
 
         # If an image is available, combine text+image embeddings
-        img_b64 = None
         if image_col and image_col in df.columns and pd.notna(row.get(image_col, None)):
             url = str(row[image_col])
             img_bytes = _download_image(url)
             if img_bytes:
-                img_b64 = base64.b64encode(img_bytes).decode("utf-8")
-                meta["_image_b64"] = img_b64
+                meta["_image_b64"] = base64.b64encode(img_bytes).decode("utf-8")
                 try:
                     pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                    iv = _emb_img(pil)
-                    tv = _emb_text(text) if text else iv
-                    vec = (tv + iv) / 2.0
+                    iv = model.encode([pil], normalize_embeddings=True).astype("float32")
+                    vec = (vec + iv) / 2.0
                 except Exception:
                     pass
-
-        if vec is None:
-            vec = _emb_text(text if text else str(row.get("title","")))
 
         metas.append(meta)
         vectors.append(vec[0])
@@ -78,7 +111,11 @@ def build_index(df: pd.DataFrame,
 
 @st.cache_resource(show_spinner=False)
 def _session_llm():
-    api_key = os.getenv("OPENAI_API_KEY") or st.session_state.get("OPENAI_API_KEY")
+    api_key = (
+        os.getenv("OPENAI_API_KEY")
+        or (st.secrets.get("OPENAI_API_KEY") if "OPENAI_API_KEY" in st.secrets else None)
+        or st.session_state.get("OPENAI_API_KEY")
+    )
     if not api_key:
         return None
     try:
@@ -87,15 +124,15 @@ def _session_llm():
     except Exception:
         return None
 
+# ----------------- Helpers -----------------
 def _download_image(url: str) -> Optional[bytes]:
     import requests
     try:
-        r = requests.get(url, timeout=7)
-        if r.status_code == 200:
-            return r.content
+        r = requests.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        return r.content
     except Exception:
         return None
-    return None
 
 def _encode_query(model: SentenceTransformer, text: str, img: Optional[Image.Image]) -> np.ndarray:
     tv = model.encode([text], normalize_embeddings=True).astype("float32") if text else None
@@ -129,22 +166,25 @@ def _answer_with_openai(query: str, snippets: List[Dict[str,Any]]) -> str:
     if client is None:
         return f"(No LLM key · showing retrieved summary)\nQuestion: {query}\n\n{ctx}"
     try:
+        model_name = (
+            os.getenv("OPENAI_MODEL")
+            or (st.secrets.get("OPENAI_MODEL") if "OPENAI_MODEL" in st.secrets else "gpt-4o-mini")
+        )
         msgs = [
             {"role":"system","content":"You are a helpful e-commerce multimodal assistant. Use retrieved facts faithfully. Answer in the user's language."},
             {"role":"user","content": f"Question:\n{query}\n\nRetrieved Context:\n{ctx}"}
         ]
-        resp = client.chat.completions.create(model=os.getenv("OPENAI_MODEL","gpt-4o-mini"),
-                                              messages=msgs, temperature=0.2)
+        resp = client.chat.completions.create(model=model_name, messages=msgs, temperature=0.2)
         return resp.choices[0].message.content
     except Exception as e:
         return f"(OpenAI call failed: {e})\nFallback summary:\n{ctx}"
 
+# ----------------- UI -----------------
 st.set_page_config(page_title="Multimodal RAG Chatbot", page_icon="🛍️", layout="wide")
 st.title("🛍️ Multimodal RAG Chatbot (MVP)")
 
 st.sidebar.header("Settings")
-csv_choice = st.sidebar.selectbox("Data Source", ["Upload CSV", "Use sample schema"], index=0)
-limit = st.sidebar.number_input("Number of samples to index", 50, 5000, 500, step=50)
+limit = st.sidebar.number_input("Number of samples to index", 50, MAX_ROWS, 2000, step=50)
 topk = st.sidebar.slider("Top-K results", 1, 10, 5)
 device = st.sidebar.selectbox("Embedding Device", ["auto","cpu"], index=0)
 
@@ -154,44 +194,50 @@ if openai_key_input:
     st.session_state["OPENAI_API_KEY"] = openai_key_input
 st.sidebar.text_input("OPENAI_MODEL", value=os.getenv("OPENAI_MODEL","gpt-4o-mini"), key="OPENAI_MODEL_BOX")
 
-# Load data
-uploaded_df = None
-if csv_choice == "Upload CSV":
-    uf = st.file_uploader("Upload CSV (recommended columns: title, brand, price, features, description, image_url)", type=["csv"])
-    if uf:
-        uploaded_df = pd.read_csv(uf)
+# Quick prompts
+st.caption("Quick prompts:")
+c1, c2, c3 = st.columns(3)
+if "qtext" not in st.session_state:
+    st.session_state["qtext"] = ""
+if c1.button("Specs: Galaxy S21"):
+    st.session_state["qtext"] = "What are the key specs of Samsung Galaxy S21?"
+if c2.button("Compare: Echo Dot vs Nest Mini"):
+    st.session_state["qtext"] = "Compare Amazon Echo Dot and Google Nest Mini for sound and smart home."
+if c3.button("Find similar to my photo"):
+    st.session_state["qtext"] = "Identify this product and list similar alternatives."
 
+# Load data (upload flow)
+uploaded_df = None
+uf = st.file_uploader(
+    "Upload CSV (supports .csv or .csv.gz) — recommended columns: title, brand, price, features, description, image_url",
+    type=["csv", "gz"]
+)
+if uf:
+    try:
+        uploaded_df = read_any_csv(uf)
+        uploaded_df = coerce_schema(uploaded_df)
+        st.success(f"Loaded {len(uploaded_df):,} rows.")
+    except Exception as e:
+        st.error(f"Failed to read file: {e}")
+
+# Build index
 build = st.button("🔨 Build / Reset Index", type="primary")
 if build:
-    if csv_choice == "Use repo dataset (data/clean_data.csv.gz)":
-        try:
-            with st.spinner("Loading repo dataset and building index..."):
-                df_repo = pd.read_csv("data/clean_data.csv.gz")  # <-- 압축 CSV 자동 인식
-                index, metas = build_index(df_repo, limit=limit,
-                                           device=None if device=="auto" else "cpu")
-                st.session_state["INDEX"] = index
-                st.session_state["METAS"] = metas
-            st.success(f"Index built from repo dataset: {len(metas)} documents")
-        except FileNotFoundError:
-            st.error("`data/clean_data.csv.gz` not found. Make sure the file exists in the repo.")
-        except Exception as e:
-            st.error(f"Failed to load repo dataset: {e}")
-
-    else:  # "Upload CSV"
-        if uploaded_df is None or uploaded_df.empty:
-            st.error("Please upload a CSV file first.")
-        else:
-            with st.spinner("Building index from uploaded CSV... (CLIP embeddings)"):
-                index, metas = build_index(uploaded_df, limit=limit,
-                                           device=None if device=="auto" else "cpu")
-                st.session_state["INDEX"] = index
-                st.session_state["METAS"] = metas
-            st.success(f"Index built: {len(metas)} documents")
+    if uploaded_df is None or uploaded_df.empty:
+        st.error("Please upload a CSV file first.")
+    else:
+        with st.spinner("Building index... (creating CLIP embeddings)"):
+            index, metas = build_index(uploaded_df, limit=limit,
+                                       device=None if device=="auto" else "cpu")
+            st.session_state["INDEX"] = index
+            st.session_state["METAS"] = metas
+        st.success(f"Index built: {len(metas)} documents")
 
 st.divider()
 qcol, icol = st.columns([2,1])
 with qcol:
-    qtext = st.text_input("💬 Ask a question", placeholder="e.g., Tell me the specs of Galaxy S21 / Compare Echo Dot vs Nest Mini")
+    qtext = st.text_input("💬 Ask a question", key="qtext",
+                          placeholder="e.g., Tell me the specs of Galaxy S21 / Compare Echo Dot vs Nest Mini")
 with icol:
     qimg = st.file_uploader("📷 Upload an image (optional)", type=["png","jpg","jpeg","webp"])
 
@@ -208,7 +254,7 @@ if send:
                 img = Image.open(qimg).convert("RGB")
                 st.image(img, caption="Query Image", width=240)
             except Exception:
-                pass
+                st.info("Could not read the uploaded image; continuing with text only.")
 
         model = load_clip(None if device=="auto" else "cpu")
         qvec = _encode_query(model, qtext or "", img)
@@ -216,7 +262,8 @@ if send:
 
         snippets = []
         for score, idx in zip(D, I):
-            if idx == -1: continue
+            if idx == -1:
+                continue
             meta = dict(st.session_state["METAS"][idx])
             _render_card(meta, float(score))
             snippets.append({
