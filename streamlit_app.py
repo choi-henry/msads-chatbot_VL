@@ -1,5 +1,5 @@
 # streamlit_app.py
-import os, io, base64, hashlib
+import os, io, base64, re
 from typing import Optional, List, Tuple, Dict, Any
 import numpy as np
 import pandas as pd
@@ -20,15 +20,51 @@ EMB_DIM = 512
 REQUEST_TIMEOUT = 7
 MAX_ROWS = 8000  # hard cap for Streamlit Cloud memory
 
+# ===== CSV schema (canonical) =====
 REQUIRED_COLS = ["title", "brand", "price", "features", "description", "image_url"]
+
+# aliases (lowercased keys) -> canonical
 ALIASES = {
+    # common
     "product_title": "title",
     "name": "title",
+    "title": "title",
+    "brand_name": "brand",
+    "brand": "brand",
     "img_url": "image_url",
+    "imageurl": "image_url",
+    "imageurlhighres": "image_url",
+    "image_link": "image_url",
     "images": "image_url",
     "feature": "features",
+    "features": "features",
     "text": "description",
+    "description": "description",
+
+    # === YOUR CSV columns ===
+    # Uniq Id, Product Name, Category, Selling Price, Model Number, About Product,
+    # Product Specification, Technical Details, Shipping Weight, Product Dimensions,
+    # Image, Variants, Product Url, Is Amazon Seller, text_blob, metadata
+    "product name": "title",
+    "selling price": "price",
+    "about product": "description",
+    "product specification": "features",
+    "technical details": "features",
+    "shipping weight": "features",
+    "product dimensions": "features",
+    "variants": "features",
+    "image": "image_url",
+    "product url": "product_url",
+    "text_blob": "description",  # fallback
 }
+
+URL_RE = re.compile(r"https?://[^\s|,;]+", re.IGNORECASE)
+
+def _first_url(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    m = URL_RE.search(s)
+    return m.group(0) if m else ""
 
 # ----------------- Caching -----------------
 @st.cache_resource
@@ -38,16 +74,66 @@ def load_clip(device: Optional[str] = None):
 
 # schema fixer
 def coerce_schema(df: pd.DataFrame) -> pd.DataFrame:
-    # rename common aliases -> canonical names
-    for old, new in ALIASES.items():
-        if old in df.columns and new not in df.columns:
-            df = df.rename(columns={old: new})
+    # 1) rename common/known aliases -> canonical
+    plan = {}
+    for c in list(df.columns):
+        key = c.lower().strip()
+        if key in ALIASES and ALIASES[key] not in df.columns:
+            plan[c] = ALIASES[key]
+    if plan:
+        df = df.rename(columns=plan)
+
+    # 2) compose features from multiple columns (your CSV + any leftovers)
+    # We will merge: features + product specification + technical details + variants + dimensions + weight
+    merge_cols = []
+    for c in ["features", "product specification", "technical details", "variants",
+              "product dimensions", "shipping weight"]:
+        if c in df.columns:
+            merge_cols.append(c)
+    if merge_cols:
+        def _merge_feats(row):
+            parts = []
+            for c in merge_cols:
+                v = row.get(c, "")
+                if isinstance(v, (list, tuple)):
+                    v = " ; ".join([str(x) for x in v if str(x).strip()])
+                v = str(v).strip()
+                if v and v.lower() not in ("nan", "none", "null"):
+                    parts.append(v)
+            return " ; ".join(parts)
+        df["features"] = df.apply(_merge_feats, axis=1)
+
+    # 3) prefer About Product, else text_blob
+    if "description" not in df.columns and "text_blob" in df.columns:
+        df = df.rename(columns={"text_blob": "description"})
+    elif "description" in df.columns and "text_blob" in df.columns:
+        df["description"] = (df["description"].fillna("").astype(str) + " " +
+                             df["text_blob"].fillna("").astype(str))
+
+    # 4) clean image_url: extract first http(s) link if the cell has mixed text
+    if "image_url" in df.columns:
+        df["image_url"] = df["image_url"].astype(str).apply(_first_url)
+
+    # 5) tidy types and fill
+    for c in ["title", "brand", "price", "features", "description", "image_url"]:
+        if c in df.columns:
+            df[c] = df[c].fillna("").astype(str)
+
+    # 6) warn if missing important columns (just informational)
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
     if missing:
         st.warning(
             f"Missing columns {missing}. The app will still work with available columns, "
             "but retrieval quality may be lower."
         )
+
+    # 7) drop rows with no usable text at all
+    text_cols = [c for c in ["title", "description", "features", "brand", "price"] if c in df.columns]
+    def _has_any_text(row):
+        return any(isinstance(row.get(c, ""), str) and row.get(c, "").strip() for c in text_cols)
+    if text_cols:
+        df = df[df.apply(_has_any_text, axis=1)].copy()
+
     return df
 
 def read_any_csv(file) -> pd.DataFrame:
@@ -83,6 +169,9 @@ def build_index(df: pd.DataFrame,
         texts.append(" | ".join(parts) if parts else "")
         rows.append(row)
 
+    if not texts:
+        raise ValueError("No usable text fields found after preprocessing.")
+
     text_vecs = model.encode(texts, normalize_embeddings=True, batch_size=64).astype("float32")
 
     for i, row in enumerate(rows):
@@ -91,16 +180,17 @@ def build_index(df: pd.DataFrame,
 
         # If an image is available, combine text+image embeddings
         if image_col and image_col in df.columns and pd.notna(row.get(image_col, None)):
-            url = str(row[image_col])
-            img_bytes = _download_image(url)
-            if img_bytes:
-                meta["_image_b64"] = base64.b64encode(img_bytes).decode("utf-8")
-                try:
-                    pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                    iv = model.encode([pil], normalize_embeddings=True).astype("float32")
-                    vec = (vec + iv) / 2.0
-                except Exception:
-                    pass
+            url = str(row[image_col]).strip()
+            if url:
+                img_bytes = _download_image(url)
+                if img_bytes:
+                    meta["_image_b64"] = base64.b64encode(img_bytes).decode("utf-8")
+                    try:
+                        pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                        iv = model.encode([pil], normalize_embeddings=True).astype("float32")
+                        vec = (vec + iv) / 2.0
+                    except Exception:
+                        pass
 
         metas.append(meta)
         vectors.append(vec[0])
@@ -146,13 +236,17 @@ def _search(index: faiss.IndexFlatIP, qvec: np.ndarray, k: int = 5) -> Tuple[np.
     return D[0], I[0]
 
 def _render_card(meta: Dict[str,Any], score: float):
-    title = meta.get("title") or meta.get("product_title") or "(no title)"
-    brand = meta.get("brand") or ""
-    price = meta.get("price") or ""
-    st.markdown(f"**🔎 {title}**  \n{brand} · {price}  \n`score={score:.3f}`")
+    title = (meta.get("title") or meta.get("product_title") or "").strip() or "(no title)"
+    brand = (meta.get("brand") or "").strip()
+    price = (meta.get("price") or "").strip()
+    st.markdown(f"**🔎 {title}**  \n{(' · '.join([x for x in [brand, price] if x]))}")
+    st.caption(f"`score={score:.3f}`")
     if "_image_b64" in meta:
-        st.image(Image.open(io.BytesIO(base64.b64decode(meta["_image_b64"]))), width=220)
-    short = (str(meta.get("features") or meta.get("description") or ""))[:300]
+        try:
+            st.image(Image.open(io.BytesIO(base64.b64decode(meta["_image_b64"]))), width=220)
+        except Exception:
+            pass
+    short = (str(meta.get("features") or meta.get("description") or "")).strip()[:300]
     if short:
         st.caption(short + ("..." if len(short)==300 else ""))
 
@@ -174,7 +268,9 @@ def _answer_with_openai(query: str, snippets: List[Dict[str,Any]]) -> str:
             {"role":"system","content":"You are a helpful e-commerce multimodal assistant. Use retrieved facts faithfully. Answer in the user's language."},
             {"role":"user","content": f"Question:\n{query}\n\nRetrieved Context:\n{ctx}"}
         ]
-        resp = client.chat.completions.create(model=model_name, messages=msgs, temperature=0.2)
+        resp = client.chat_completions.create(model=model_name, messages=msgs, temperature=0.2) \
+            if hasattr(client, "chat_completions") else \
+            client.chat.completions.create(model=model_name, messages=msgs, temperature=0.2)
         return resp.choices[0].message.content
     except Exception as e:
         return f"(OpenAI call failed: {e})\nFallback summary:\n{ctx}"
@@ -216,7 +312,8 @@ if uf:
     try:
         uploaded_df = read_any_csv(uf)
         uploaded_df = coerce_schema(uploaded_df)
-        st.success(f"Loaded {len(uploaded_df):,} rows.")
+        st.success(f"Loaded {len(uploaded_df):,} rows. Columns: {list(uploaded_df.columns)}")
+        st.dataframe(uploaded_df.head(5))
     except Exception as e:
         st.error(f"Failed to read file: {e}")
 
