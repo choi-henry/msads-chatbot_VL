@@ -370,7 +370,7 @@ def ensure_index_ready() -> bool:
     except Exception as e:
         st.error(f"Failed to load artifacts: {e}")
 
-    # 3) 리포에 포함된 기본 데이터셋으로 자동 빌드 (parquet 우선, 없으면 csv)
+    # 3) 리포 기본 데이터셋으로 자동 빌드
     try:
         src = "clean_data.parquet" if os.path.exists("clean_data.parquet") else "clean_data.csv"
         with st.spinner(f"Preparing index from bundled dataset ({src})..."):
@@ -380,7 +380,7 @@ def ensure_index_ready() -> bool:
                 df,
                 device=None if device == "auto" else device,
                 use_images=True,
-                limit=MAX_ROWS,          # 메모리 안전 캡
+                limit=MAX_ROWS,
                 outdir="artifacts",
                 batch_size=64,
                 force_rebuild=False
@@ -405,8 +405,7 @@ with qcol:
         placeholder="e.g., Tell me the specs of Galaxy S21 / Compare Echo Dot vs Nest Mini",
     )
 with icol:
-    qimg = st.file_uploader("📷 Upload an image (optional)",
-                            type=["png", "jpg", "jpeg", "webp"])
+    qimg = st.file_uploader("📷 Upload an image (optional)", type=["png", "jpg", "jpeg", "webp"])
 
 send = st.button("Send", type="primary")
 if send:
@@ -443,6 +442,3 @@ if send:
 
         ans = _answer_with_openai(qtext or "(image query)", snippets)
         st.chat_message("assistant").write(ans)
-            st.error(f"Failed to read/prepare dataset: {e}")
-    else:
-        st.warning("Upload a dataset (parquet/csv) or uncheck 'Use prebuilt artifacts' to manage manually.")
