@@ -326,28 +326,20 @@ def _answer_with_openai(query: str, snippets: List[Dict[str,Any]]) -> str:
 st.set_page_config(page_title="Multimodal RAG Chatbot", page_icon="🛍️", layout="wide")
 st.title("🛍️ Multimodal RAG Chatbot (MVP)")
 
+# --- Sidebar  ---
 st.sidebar.header("Settings")
-limit = st.sidebar.number_input("Number of samples to index", 50, MAX_ROWS, 2000, step=50)
 topk = st.sidebar.slider("Top-K results", 1, 10, 5)
-device = st.sidebar.selectbox("Embedding Device", ["auto","cpu"], index=0)
-
-# --- Pipeline integration: load prebuilt artifacts ---
-st.sidebar.subheader("Index Source")
-use_prebuilt = st.sidebar.checkbox("Use prebuilt artifacts (artifacts/index.faiss + metas.json)", value=True)
-
-if use_prebuilt:
-    st.sidebar.caption("If artifacts are not in repo, upload them below.")
-    up_idx = st.sidebar.file_uploader("Upload index.faiss", type=["faiss"], accept_multiple_files=False)
-    up_meta = st.sidebar.file_uploader("Upload metas.json", type=["json"], accept_multiple_files=False)
-    if st.sidebar.button("Save uploaded artifacts"):
-        ok, msg = save_uploaded_artifacts(up_idx, up_meta, dirpath="artifacts")
-        (st.sidebar.success if ok else st.sidebar.error)(msg)
+device = st.sidebar.selectbox("Embedding Device", ["auto", "cpu"], index=0)
 
 st.sidebar.subheader("OpenAI (optional)")
-openai_key_input = st.sidebar.text_input("OPENAI_API_KEY", type="password", value=os.getenv("OPENAI_API_KEY",""))
+openai_key_input = st.sidebar.text_input(
+    "OPENAI_API_KEY", type="password", value=os.getenv("OPENAI_API_KEY", "")
+)
 if openai_key_input:
     st.session_state["OPENAI_API_KEY"] = openai_key_input
-st.sidebar.text_input("OPENAI_MODEL", value=os.getenv("OPENAI_MODEL","gpt-4o-mini"), key="OPENAI_MODEL_BOX")
+st.sidebar.text_input(
+    "OPENAI_MODEL", value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"), key="OPENAI_MODEL_BOX"
+)
 
 # Quick prompts
 st.caption("Quick prompts:")
@@ -361,52 +353,96 @@ if c2.button("Compare: Echo Dot vs Nest Mini"):
 if c3.button("Find similar to my photo"):
     st.session_state["qtext"] = "Identify this product and list similar alternatives."
 
-# ===== Load/Build Index =====
-index_loaded = False
-if use_prebuilt and artifacts_exist("artifacts"):
+# ===== Index 준비 (업로드 UI 없음) =====
+def ensure_index_ready() -> bool:
+    # 1) 이미 세션에 있으면 재사용
+    if "INDEX" in st.session_state and "METAS" in st.session_state:
+        return True
+
+    # 2) artifacts/ 가 있으면 로드
     try:
-        index, metas = load_artifacts("artifacts")
-        st.session_state["INDEX"] = index
-        st.session_state["METAS"] = metas
-        index_loaded = True
-        st.success(f"Loaded prebuilt index: {len(metas)} documents")
+        if artifacts_exist("artifacts"):
+            idx, metas = load_artifacts("artifacts")
+            st.session_state["INDEX"] = idx
+            st.session_state["METAS"] = metas
+            st.success(f"Loaded prebuilt index: {len(metas)} documents")
+            return True
     except Exception as e:
         st.error(f"Failed to load artifacts: {e}")
 
-# Fallback: build from bundled dataset or upload (auto build_or_load_index)
-uploaded_df = None
-if not index_loaded:
-    st.info("No prebuilt artifacts loaded. Upload a dataset to auto-build the index (first time only).")
-    uf = st.file_uploader(
-        "Upload dataset (.parquet / .csv / .csv.gz). Columns auto-mapped to: "
-        "title, brand, price, features, description, image_url",
-        type=["parquet", "csv", "gz"]
-    )
-
-    if uf:
-        try:
-            uploaded_df = read_any(uf)
-            uploaded_df = coerce_schema(uploaded_df)
-            st.success(f"Loaded {len(uploaded_df):,} rows. Columns: {list(uploaded_df.columns)}")
-            st.dataframe(uploaded_df.head(5))
-
-            # 🔁 자동 빌드/로드: artifacts가 fingerprint와 일치하면 재사용, 아니면 새로 빌드
-            with st.spinner("Preparing index (build or reuse artifacts)..."):
-                index, metas = build_or_load_index(
-                    uploaded_df,
-                    device=None if device == "auto" else device,  # "auto" -> None
-                    use_images=True,               # image_url / image_b64 있으면 멀티모달 결합
-                    limit=limit,                   # sidebar에서 받은 cap
-                    outdir="artifacts",            # Streamlit Cloud에서도 그대로 사용
-                    batch_size=64,                 # 필요시 조정 가능
-                    force_rebuild=False            # 필요시 True로 바꿔 강제 재빌드
-                )
-                st.session_state["INDEX"] = index
-                st.session_state["METAS"] = metas
-                index_loaded = True
+    # 3) 리포에 포함된 기본 데이터셋으로 자동 빌드 (parquet 우선, 없으면 csv)
+    try:
+        src = "clean_data.parquet" if os.path.exists("clean_data.parquet") else "clean_data.csv"
+        with st.spinner(f"Preparing index from bundled dataset ({src})..."):
+            df = read_any(src)
+            df = coerce_schema(df)
+            idx, metas = build_or_load_index(
+                df,
+                device=None if device == "auto" else device,
+                use_images=True,
+                limit=MAX_ROWS,          # 메모리 안전 캡
+                outdir="artifacts",
+                batch_size=64,
+                force_rebuild=False
+            )
+            st.session_state["INDEX"] = idx
+            st.session_state["METAS"] = metas
             st.success(f"Index ready: {len(metas)} documents")
+            return True
+    except Exception as e:
+        st.error(f"Could not prepare index automatically: {e}")
 
-        except Exception as e:
+    return False
+
+index_loaded = ensure_index_ready()
+
+st.divider()
+qcol, icol = st.columns([2, 1])
+with qcol:
+    qtext = st.text_input(
+        "💬 Ask a question",
+        key="qtext",
+        placeholder="e.g., Tell me the specs of Galaxy S21 / Compare Echo Dot vs Nest Mini",
+    )
+with icol:
+    qimg = st.file_uploader("📷 Upload an image (optional)",
+                            type=["png", "jpg", "jpeg", "webp"])
+
+send = st.button("Send", type="primary")
+if send:
+    if not index_loaded:
+        st.warning("Index is not ready. Please refresh the app.")
+    elif not qtext and not qimg:
+        st.warning("Enter a question or upload an image.")
+    else:
+        img = None
+        if qimg:
+            try:
+                img = Image.open(qimg).convert("RGB")
+                st.image(img, caption="Query Image", width=240)
+            except Exception:
+                st.info("Could not read the uploaded image; continuing with text only.")
+
+        model = load_clip(None if device == "auto" else "cpu")
+        qvec = _encode_query(model, qtext or "", img)
+        D, I = _search(st.session_state["INDEX"], qvec, k=topk)
+
+        snippets = []
+        for score, idx in zip(D, I):
+            if idx == -1:
+                continue
+            meta = dict(st.session_state["METAS"][idx])
+            _render_card(meta, float(score))
+            snippets.append({
+                "title": meta.get("title"),
+                "brand": meta.get("brand"),
+                "price": meta.get("price"),
+                "features": meta.get("features"),
+                "description": meta.get("description")
+            })
+
+        ans = _answer_with_openai(qtext or "(image query)", snippets)
+        st.chat_message("assistant").write(ans)
             st.error(f"Failed to read/prepare dataset: {e}")
     else:
         st.warning("Upload a dataset (parquet/csv) or uncheck 'Use prebuilt artifacts' to manage manually.")
