@@ -263,6 +263,9 @@ def _answer_with_openai(query: str, snippets: List[Dict[str,Any]]) -> str:
         model_name = (
             os.getenv("OPENAI_MODEL")
             or (st.secrets.get("OPENAI_MODEL") if "OPENAI_MODEL" in st.secrets else "gpt-4o-mini")
+            or (st.secrets.get("OPENAI_MODEL") if "OPENAI_MODEL" in st.secrets else None)
+            or st.session_state.get("OPENAI_MODEL_BOX")
+            or "gpt-4o-mini"
         )
         msgs = [
             {"role":"system","content":"You are a helpful e-commerce multimodal assistant. Use retrieved facts faithfully. Answer in the user's language."},
