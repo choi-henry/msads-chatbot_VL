@@ -317,34 +317,69 @@ if c2.button("Compare: Echo Dot vs Nest Mini"):
 if c3.button("Find similar to my photo"):
     st.session_state["qtext"] = "Identify this product and list similar alternatives."
 
-# Load data from bundled parquet file
+# --- Load data from bundled parquet file (with safe column sanitization) ---
+def _sanitize_columns(df):
+    # 1) 컬럼명을 문자열로 평탄화
+    def _to_str(c):
+        if isinstance(c, tuple):
+            return "_".join(map(str, c)).strip()
+        return str(c).strip()
+
+    cols = [_to_str(c) for c in df.columns]
+
+    # 2) Unnamed, 빈 문자열 처리
+    cols = [("col" if (c == "" or c.lower().startswith("unnamed")) else c) for c in cols]
+
+    # 3) 중복 컬럼명 뒤에 _2, _3 … 접미사 부여
+    seen, unique = {}, []
+    for c in cols:
+        if c in seen:
+            seen[c] += 1
+            unique.append(f"{c}_{seen[c]}")
+        else:
+            seen[c] = 0
+            unique.append(c)
+    df.columns = unique
+    return df
+
 uploaded_df = load_default_dataset()
+uploaded_df = _sanitize_columns(uploaded_df)
+
 st.success(
-    f"Loaded {len(uploaded_df):,} rows from bundled dataset. Columns: {list(uploaded_df.columns)}"
+    f"Loaded {len(uploaded_df):,} rows from bundled dataset. "
+    f"Columns: {list(uploaded_df.columns)}"
 )
 st.dataframe(uploaded_df.head(5))
 
-# Build index
+
+# --- Build index ---
 build = st.button("🔨 Build / Reset Index", type="primary")
 if build:
-  if uploaded_df.empty:
-      st.error("Bundled dataset is empty.")
-  else:
+    if uploaded_df.empty:
+        st.error("Bundled dataset is empty.")
+    else:
         with st.spinner("Building index... (creating CLIP embeddings)"):
-          index, metas = build_index(
-                uploaded_df, limit=limit, device=None if device == "auto" else "cpu"
+            index, metas = build_index(
+                uploaded_df,
+                limit=limit,
+                device=None if device == "auto" else "cpu",
             )
-        st.session_state["INDEX"] = index
-        st.session_state["METAS"] = metas
+            st.session_state["INDEX"] = index
+            st.session_state["METAS"] = metas
         st.success(f"Index built: {len(metas)} documents")
 
+
 st.divider()
-qcol, icol = st.columns([2,1])
+qcol, icol = st.columns([2, 1])
 with qcol:
-    qtext = st.text_input("💬 Ask a question", key="qtext",
-                          placeholder="e.g., Tell me the specs of Galaxy S21 / Compare Echo Dot vs Nest Mini")
+    qtext = st.text_input(
+        "💬 Ask a question",
+        key="qtext",
+        placeholder="e.g., Tell me the specs of Galaxy S21 / Compare Echo Dot vs Nest Mini",
+    )
 with icol:
-    qimg = st.file_uploader("📷 Upload an image (optional)", type=["png","jpg","jpeg","webp"])
+    qimg = st.file_uploader("📷 Upload an image (optional)",
+                            type=["png", "jpg", "jpeg", "webp"])
 
 send = st.button("Send", type="primary")
 if send:
@@ -361,11 +396,12 @@ if send:
             except Exception:
                 st.info("Could not read the uploaded image; continuing with text only.")
 
-        model = load_clip(None if device=="auto" else "cpu")
+        model = load_clip(None if device == "auto" else "cpu")
         qvec = _encode_query(model, qtext or "", img)
         D, I = _search(st.session_state["INDEX"], qvec, k=topk)
 
         snippets = []
+        # NOTE: _search가 (scores, idxes) 2D를 돌려주면 D[0], I[0]으로 바꾸세요.
         for score, idx in zip(D, I):
             if idx == -1:
                 continue
@@ -376,7 +412,7 @@ if send:
                 "brand": meta.get("brand"),
                 "price": meta.get("price"),
                 "features": meta.get("features"),
-                "description": meta.get("description")
+                "description": meta.get("description"),
             })
 
         ans = _answer_with_openai(qtext or "(image query)", snippets)
