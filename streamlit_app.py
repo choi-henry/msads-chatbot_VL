@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 import streamlit as st
+from pipeline import build_or_load_index
 
 # --- Runtime deps ---
 try:
@@ -358,77 +359,40 @@ if use_prebuilt and artifacts_exist("artifacts"):
     except Exception as e:
         st.error(f"Failed to load artifacts: {e}")
 
-# Fallback: build from bundled dataset or upload
+# Fallback: build from bundled dataset or upload (auto build_or_load_index)
 uploaded_df = None
 if not index_loaded:
-    st.info("No prebuilt artifacts loaded. You can upload a dataset to build an index here.")
+    st.info("No prebuilt artifacts loaded. Upload a dataset to auto-build the index (first time only).")
     uf = st.file_uploader(
         "Upload dataset (.parquet / .csv / .csv.gz). Columns auto-mapped to: "
         "title, brand, price, features, description, image_url",
         type=["parquet", "csv", "gz"]
     )
+
     if uf:
         try:
             uploaded_df = read_any(uf)
             uploaded_df = coerce_schema(uploaded_df)
             st.success(f"Loaded {len(uploaded_df):,} rows. Columns: {list(uploaded_df.columns)}")
             st.dataframe(uploaded_df.head(5))
-        except Exception as e:
-            st.error(f"Failed to read/parse file: {e}")
 
-    build = st.button("🔨 Build / Reset Index", type="primary")
-    if build:
-        if uploaded_df is None or uploaded_df.empty:
-            st.error("Please upload a dataset first.")
-        else:
-            with st.spinner("Building index... (creating CLIP embeddings)"):
-                index, metas = build_index(uploaded_df, limit=limit,
-                                           device=None if device=="auto" else "cpu")
+            # 🔁 자동 빌드/로드: artifacts가 fingerprint와 일치하면 재사용, 아니면 새로 빌드
+            with st.spinner("Preparing index (build or reuse artifacts)..."):
+                index, metas = build_or_load_index(
+                    uploaded_df,
+                    device=None if device == "auto" else device,  # "auto" -> None
+                    use_images=True,               # image_url / image_b64 있으면 멀티모달 결합
+                    limit=limit,                   # sidebar에서 받은 cap
+                    outdir="artifacts",            # Streamlit Cloud에서도 그대로 사용
+                    batch_size=64,                 # 필요시 조정 가능
+                    force_rebuild=False            # 필요시 True로 바꿔 강제 재빌드
+                )
                 st.session_state["INDEX"] = index
                 st.session_state["METAS"] = metas
-            st.success(f"Index built: {len(metas)} documents")
-            index_loaded = True
+                index_loaded = True
+            st.success(f"Index ready: {len(metas)} documents")
 
-st.divider()
-qcol, icol = st.columns([2,1])
-with qcol:
-    qtext = st.text_input("💬 Ask a question", key="qtext",
-                          placeholder="e.g., Tell me the specs of Galaxy S21 / Compare Echo Dot vs Nest Mini")
-with icol:
-    qimg = st.file_uploader("📷 Upload an image (optional)", type=["png","jpg","jpeg","webp"])
-
-send = st.button("Send", type="primary")
-if send:
-    if "INDEX" not in st.session_state:
-        st.warning("Please load artifacts or build the index first.")
-    elif not qtext and not qimg:
-        st.warning("Enter a question or upload an image.")
+        except Exception as e:
+            st.error(f"Failed to read/prepare dataset: {e}")
     else:
-        img = None
-        if qimg:
-            try:
-                img = Image.open(qimg).convert("RGB")
-                st.image(img, caption="Query Image", width=240)
-            except Exception:
-                st.info("Could not read the uploaded image; continuing with text only.")
-
-        model = load_clip(None if device=="auto" else "cpu")
-        qvec = _encode_query(model, qtext or "", img)
-        D, I = _search(st.session_state["INDEX"], qvec, k=topk)
-
-        snippets = []
-        for score, idx in zip(D, I):
-            if idx == -1:
-                continue
-            meta = dict(st.session_state["METAS"][idx])
-            _render_card(meta, float(score))
-            snippets.append({
-                "title": meta.get("title"),
-                "brand": meta.get("brand"),
-                "price": meta.get("price"),
-                "features": meta.get("features"),
-                "description": meta.get("description")
-            })
-
-        ans = _answer_with_openai(qtext or "(image query)", snippets)
-        st.chat_message("assistant").write(ans)
+        st.warning("Upload a dataset (parquet/csv) or uncheck 'Use prebuilt artifacts' to manage manually.")
