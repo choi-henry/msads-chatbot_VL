@@ -5,7 +5,21 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 import streamlit as st
-from pipeline import build_or_load_index
+
+# safe import for pipeline.py (works on Streamlit Cloud & local)
+try:
+    from pipeline import build_or_load_index  # preferred
+except Exception as e:
+    # Fallback: load pipeline.py by path (handles path/import edge cases)
+    import importlib.util, sys, pathlib
+    import streamlit as st
+    st.warning(f"Direct import failed: {e}. Falling back to path-based loader.")
+    p = pathlib.Path(__file__).with_name("pipeline.py")
+    spec = importlib.util.spec_from_file_location("pipeline", p)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)  # type: ignore
+    build_or_load_index = mod.build_or_load_index
 
 # --- Runtime deps ---
 try:
