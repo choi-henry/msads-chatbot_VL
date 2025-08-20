@@ -328,8 +328,8 @@ st.dataframe(uploaded_df.head(5))
 build = st.button("🔨 Build / Reset Index", type="primary")
 if build:
   if uploaded_df.empty:
-        st.error("Bundled dataset is empty.")
-    else:
+      st.error("Bundled dataset is empty.")
+  else:
         with st.spinner("Building index... (creating CLIP embeddings)"):
           index, metas = build_index(
                 uploaded_df, limit=limit, device=None if device == "auto" else "cpu"
