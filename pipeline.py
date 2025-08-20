@@ -1,9 +1,4 @@
-#pipeline.py — Build & use a multimodal FAISS index from product data.
 
-- Input: clean_data.parquet (or .csv/.csv.gz)
-- Output: artifacts/index.faiss, artifacts/metas.json, artifacts/manifest.json
-- Embeddings: CLIP (text + optional image) via sentence_transformers
-"""
 import os, io, re, json, base64, argparse, hashlib
 from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
