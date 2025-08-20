@@ -1,10 +1,16 @@
-import os, io, re, json, base64, argparse
+#pipeline.py — Build & use a multimodal FAISS index from product data.
+
+- Input: clean_data.parquet (or .csv/.csv.gz)
+- Output: artifacts/index.faiss, artifacts/metas.json, artifacts/manifest.json
+- Embeddings: CLIP (text + optional image) via sentence_transformers
+"""
+import os, io, re, json, base64, argparse, hashlib
 from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 # Runtime deps
 import faiss                           # pip install faiss-cpu
@@ -13,7 +19,7 @@ from sentence_transformers import SentenceTransformer
 try:
     import requests
 except Exception:
-    requests = None  # we guard usage below
+    requests = None  # guarded usage
 
 EMB_MODEL = "clip-ViT-B-32"
 EMB_DIM = 512
@@ -31,7 +37,7 @@ ALIASES = {
     "product_description":"description","short_description":"description","long_description":"description","text":"description","description":"description",
     "imageurl":"image_url","imageurlhighres":"image_url","image_link":"image_url","images":"image_url","img_url":"image_url","image":"image_url",
 
-    # Henry CSV 스키마 대응
+    # Henry CSV 대응
     "product name":"title",
     "selling price":"price",
     "about product":"description",
@@ -50,27 +56,18 @@ def _first_url(s: str) -> str:
     m = URL_RE.search(s)
     return m.group(0) if m else ""
 
-def parse_meta_cell(val: Any) -> Dict[str, Any]:
-    """metadata 컬럼이 dict/JSON/str 섞여 있을 때 dict로 파싱"""
-    if isinstance(val, dict):
-        return val
-    if isinstance(val, str) and val.strip():
-        try:
-            return json.loads(val)
-        except Exception:
-            out = {}
-            for part in re.split(r"[|;]\s*", val):
-                if ":" in part:
-                    k, v = part.split(":", 1)
-                    out[k.strip()] = v.strip()
-            return out
-    return {}
+def df_fingerprint(df: pd.DataFrame, sample_rows: int = 500) -> str:
+    """Quick data fingerprint (row count + head sample) to decide reuse vs rebuild."""
+    head = df.head(sample_rows).copy()
+    head = head.sort_index(axis=1)
+    payload = str((len(df), tuple(map(tuple, head.fillna("").astype(str).values.tolist())))).encode("utf-8")
+    return hashlib.md5(payload).hexdigest()
 
 def coerce_schema(df: pd.DataFrame) -> pd.DataFrame:
     # 1) rename → canonical
     plan = {}
     for c in list(df.columns):
-        key = c.lower().strip()
+        key = str(c).lower().strip()
         if key in ALIASES and ALIASES[key] not in df.columns:
             plan[c] = ALIASES[key]
     if plan:
@@ -128,7 +125,7 @@ def _download_image(url: str) -> Optional[bytes]:
         return None
 
 def embed_rows(df: pd.DataFrame, model: SentenceTransformer, use_images: bool,
-               limit: Optional[int]=None) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+               limit: Optional[int]=None, batch_size: int = 64) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
     if limit:
         df = df.head(limit)
 
@@ -141,7 +138,7 @@ def embed_rows(df: pd.DataFrame, model: SentenceTransformer, use_images: bool,
     if not texts:
         raise ValueError("No usable text after preprocessing; check your columns.")
 
-    text_vecs = model.encode(texts, normalize_embeddings=True, batch_size=64).astype("float32")
+    text_vecs = model.encode(texts, normalize_embeddings=True, batch_size=batch_size).astype("float32")
 
     metas: List[Dict[str, Any]] = []
     vecs: List[np.ndarray] = []
@@ -164,9 +161,13 @@ def embed_rows(df: pd.DataFrame, model: SentenceTransformer, use_images: bool,
                 try:
                     raw = base64.b64decode(b64)
                     meta["_image_b64"] = b64
-                    pil = Image.open(io.BytesIO(raw)).convert("RGB")
-                    iv = model.encode([pil], normalize_embeddings=True).astype("float32")
-                    vec = (vec + iv) / 2.0
+                    try:
+                        pil = Image.open(io.BytesIO(raw)).convert("RGB")
+                    except UnidentifiedImageError:
+                        pil = None
+                    if pil is not None:
+                        iv = model.encode([pil], normalize_embeddings=True).astype("float32")
+                        vec = (vec + iv) / 2.0
                 except Exception:
                     pass
             else:
@@ -177,10 +178,14 @@ def embed_rows(df: pd.DataFrame, model: SentenceTransformer, use_images: bool,
                         meta["_image_b64"] = base64.b64encode(raw).decode("utf-8")
                         try:
                             pil = Image.open(io.BytesIO(raw)).convert("RGB")
-                            iv = model.encode([pil], normalize_embeddings=True).astype("float32")
-                            vec = (vec + iv) / 2.0
-                        except Exception:
-                            pass
+                        except UnidentifiedImageError:
+                            pil = None
+                        if pil is not None:
+                            try:
+                                iv = model.encode([pil], normalize_embeddings=True).astype("float32")
+                                vec = (vec + iv) / 2.0
+                            except Exception:
+                                pass
 
         metas.append(meta)
         vecs.append(vec[0])
@@ -194,17 +199,49 @@ def build_faiss(X: np.ndarray) -> faiss.IndexFlatIP:
     idx.add(X.astype("float32"))
     return idx
 
-def save_artifacts(index: faiss.Index, metas: List[Dict[str, Any]], outdir: str):
+def save_artifacts(index: faiss.Index, metas: List[Dict[str, Any]], outdir: str, manifest_extra: Dict[str, Any] = None):
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
     faiss.write_index(index, str(out/"index.faiss"))
     (out/"metas.json").write_text(json.dumps(metas, ensure_ascii=False), encoding="utf-8")
-    (out/"manifest.json").write_text(json.dumps({"emb_model": EMB_MODEL, "emb_dim": EMB_DIM}, ensure_ascii=False), encoding="utf-8")
+    manifest = {"emb_model": EMB_MODEL, "emb_dim": EMB_DIM}
+    if manifest_extra:
+        manifest.update(manifest_extra)
+    (out/"manifest.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
 
 def load_artifacts(outdir: str) -> Tuple[faiss.Index, List[Dict[str, Any]]]:
     out = Path(outdir)
     index = faiss.read_index(str(out/"index.faiss"))
     metas = json.loads((out/"metas.json").read_text(encoding="utf-8"))
+    return index, metas
+
+def artifacts_exist(outdir: str) -> bool:
+    out = Path(outdir)
+    return (out/"index.faiss").exists() and (out/"metas.json").exists() and (out/"manifest.json").exists()
+
+def load_manifest(outdir: str) -> Dict[str, Any]:
+    out = Path(outdir)
+    try:
+        return json.loads((out/"manifest.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def build_or_load_index(df: pd.DataFrame, device: Optional[str], use_images: bool,
+                        limit: Optional[int], outdir: str, batch_size: int = 64,
+                        force_rebuild: bool = False):
+    """If artifacts exist and fingerprint matches, load; otherwise build & save."""
+    current_fp = df_fingerprint(df)
+    if (not force_rebuild) and artifacts_exist(outdir):
+        mf = load_manifest(outdir)
+        if mf.get("data_fingerprint") == current_fp and mf.get("emb_model") == EMB_MODEL and mf.get("emb_dim") == EMB_DIM:
+            print(f"[pipeline] reuse artifacts at {outdir} (fingerprint match)")
+            return load_artifacts(outdir)
+
+    print("[pipeline] building new artifacts...")
+    model = load_clip(device)
+    X, metas = embed_rows(df, model, use_images=use_images, limit=limit, batch_size=batch_size)
+    index = build_faiss(X)
+    save_artifacts(index, metas, outdir, manifest_extra={"data_fingerprint": current_fp})
     return index, metas
 
 # ---------- Query ----------
@@ -213,40 +250,50 @@ def encode_query(model: SentenceTransformer, text: str = "", image_path: Optiona
     iv = None
     if image_path:
         with open(image_path, "rb") as f:
-            pil = Image.open(io.BytesIO(f.read())).convert("RGB")
-        iv = model.encode([pil], normalize_embeddings=True).astype("float32")
+            raw = f.read()
+        try:
+            pil = Image.open(io.BytesIO(raw)).convert("RGB")
+            iv = model.encode([pil], normalize_embeddings=True).astype("float32")
+        except UnidentifiedImageError:
+            iv = None
     if tv is not None and iv is not None:
         return ((tv + iv) / 2.0).astype("float32")
     return (tv if tv is not None else iv).astype("float32")
 
 def search(index: faiss.IndexFlatIP, qvec: np.ndarray, k: int = 5):
     D, I = index.search(qvec, k)
-    return D[0].tolist(), I[0].tolist()
+    D, I = D[0].tolist(), I[0].tolist()
+    pairs = [(d, i) for d, i in zip(D, I) if i >= 0]
+    return [p[0] for p in pairs], [p[1] for p in pairs]
 
-# ---------- CLI ----------
+# ---------- IO helpers ----------
 def read_any(path: str) -> pd.DataFrame:
     p = str(path)
     if p.endswith(".parquet"):
         return pd.read_parquet(p)
     if p.endswith(".gz") or p.endswith(".csv"):
         return pd.read_csv(p, compression="infer")
-    # try auto
     try:
         return pd.read_parquet(p)
     except Exception:
         return pd.read_csv(p, compression="infer")
 
+# ---------- CLI ----------
 def main():
     ap = argparse.ArgumentParser(description="Build & query a multimodal FAISS index.")
     ap.add_argument("--data", default="clean_data.parquet", help="Input parquet/csv path")
     ap.add_argument("--outdir", default="artifacts", help="Where to save index & metas")
     ap.add_argument("--limit", type=int, default=None, help="Head limit")
-    ap.add_argument("--device", default=None, choices=[None,"cpu","cuda","mps"], help="Encoder device")
+    ap.add_argument("--device", default="auto", choices=["auto","cpu","cuda","mps"], help="Encoder device")
     ap.add_argument("--with-images", action="store_true", help="Combine image embeddings if available")
-    ap.add_argument("--query", default=None, help="Quick test query after build")
+    ap.add_argument("--rebuild", action="store_true", help="Force rebuild even if artifacts match")
+    ap.add_argument("--query", default=None, help="Quick test query after build/load")
     ap.add_argument("--image", default=None, help="Optional query image path")
     ap.add_argument("--topk", type=int, default=5)
+    ap.add_argument("--batch-size", type=int, default=64)
     args = ap.parse_args()
+
+    device = None if args.device == "auto" else args.device
 
     print(f"[pipeline] loading: {args.data}")
     df = read_any(args.data)
@@ -255,20 +302,27 @@ def main():
     df = coerce_schema(df)
     print(f"[pipeline] columns -> {list(df.columns)}")
 
-    model = load_clip(args.device)
-    X, metas = embed_rows(df, model, use_images=args.with_images, limit=args.limit)
-    index = build_faiss(X)
-    save_artifacts(index, metas, args.outdir)
-    print(f"[pipeline] saved artifacts to {args.outdir} (docs={len(metas)})")
+    # build or load
+    index, metas = build_or_load_index(
+        df, device=device, use_images=args.with_images,
+        limit=args.limit, outdir=args.outdir,
+        batch_size=args.batch_size, force_rebuild=args.rebuild
+    )
+    print(f"[pipeline] ready (docs={len(metas)}) at {args.outdir}")
 
+    # quick search
     if args.query or args.image:
-        print(f"[pipeline] quick search: q='{args.query}' img='{args.image}'")
+        model = load_clip(device)
         qvec = encode_query(model, args.query or "", args.image)
         D, I = search(index, qvec, k=args.topk)
         for rank, (d, i) in enumerate(zip(D, I), start=1):
-            m = metas[i] if 0 <= i < len(metas) else {}
+            if i < 0 or i >= len(metas):
+                continue
+            m = metas[i]
             print(f"{rank:2d}. score={d:.3f} | {m.get('title','(no title)')} | {m.get('brand','')} | {m.get('price','')}")
-            if m.get('image_url'): print("    img:", m.get('image_url'))
+            if m.get('image_url'):
+                print("    img:", m.get('image_url'))
 
 if __name__ == "__main__":
     main()
+
