@@ -1,5 +1,5 @@
 # streamlit_app.py
-import os, io, base64, re
+import os, io, base64, re, json
 from typing import Optional, List, Tuple, Dict, Any
 import numpy as np
 import pandas as pd
@@ -41,10 +41,7 @@ ALIASES = {
     "text": "description",
     "description": "description",
 
-    # === YOUR CSV columns ===
-    # Uniq Id, Product Name, Category, Selling Price, Model Number, About Product,
-    # Product Specification, Technical Details, Shipping Weight, Product Dimensions,
-    # Image, Variants, Product Url, Is Amazon Seller, text_blob, metadata
+    # CSV 예: Uniq Id, Product Name, ... Image, Variants, text_blob ...
     "product name": "title",
     "selling price": "price",
     "about product": "description",
@@ -55,7 +52,7 @@ ALIASES = {
     "variants": "features",
     "image": "image_url",
     "product url": "product_url",
-    "text_blob": "description",  # fallback
+    "text_blob": "description",
 }
 
 URL_RE = re.compile(r"https?://[^\s|,;]+", re.IGNORECASE)
@@ -77,14 +74,13 @@ def coerce_schema(df: pd.DataFrame) -> pd.DataFrame:
     # 1) rename common/known aliases -> canonical
     plan = {}
     for c in list(df.columns):
-        key = c.lower().strip()
+        key = str(c).lower().strip()
         if key in ALIASES and ALIASES[key] not in df.columns:
             plan[c] = ALIASES[key]
     if plan:
         df = df.rename(columns=plan)
 
-    # 2) compose features from multiple columns (your CSV + any leftovers)
-    # We will merge: features + product specification + technical details + variants + dimensions + weight
+    # 2) compose features from multiple columns
     merge_cols = []
     for c in ["features", "product specification", "technical details", "variants",
               "product dimensions", "shipping weight"]:
@@ -103,14 +99,11 @@ def coerce_schema(df: pd.DataFrame) -> pd.DataFrame:
             return " ; ".join(parts)
         df["features"] = df.apply(_merge_feats, axis=1)
 
-    # 3) prefer About Product, else text_blob
-    if "description" not in df.columns and "text_blob" in df.columns:
-        df = df.rename(columns={"text_blob": "description"})
-    elif "description" in df.columns and "text_blob" in df.columns:
-        df["description"] = (df["description"].fillna("").astype(str) + " " +
-                             df["text_blob"].fillna("").astype(str))
+    # 3) prefer About Product, else text_blob (이미 ALIASES로 description에 매핑됨)
+    if "description" in df.columns:
+        df["description"] = df["description"].fillna("").astype(str)
 
-    # 4) clean image_url: extract first http(s) link if the cell has mixed text
+    # 4) clean image_url
     if "image_url" in df.columns:
         df["image_url"] = df["image_url"].astype(str).apply(_first_url)
 
@@ -136,28 +129,52 @@ def coerce_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-def read_any_csv(file) -> pd.DataFrame:
-    """Accepts .csv or .csv.gz (compression inferred)."""
-    name = getattr(file, "name", "")
-    if isinstance(file, str) and not name:
-        name = file
-    if name.endswith(".gz"):
-        return pd.read_csv(file, compression="infer")
-    return pd.read_csv(file)
-
-
-# Load default dataset bundled with the app
-@st.cache_resource(show_spinner=False)
-def load_default_dataset() -> pd.DataFrame:
-    """Load `clean_data.parquet` from the repository and coerce its schema."""
+def read_any(path_or_file) -> pd.DataFrame:
+    """Accepts parquet/csv/csv.gz; file-like or path."""
+    name = getattr(path_or_file, "name", "")
+    if isinstance(path_or_file, str) and not name:
+        name = path_or_file
+    if name.endswith(".parquet"):
+        return pd.read_parquet(path_or_file)
+    if name.endswith(".gz") or name.endswith(".csv"):
+        return pd.read_csv(path_or_file, compression="infer")
+    # try parquet then csv
     try:
-        df = pd.read_parquet("clean_data.parquet")
-        return coerce_schema(df)
-    except Exception as e:
-        st.error(f"Failed to load bundled dataset: {e}")
-        return pd.DataFrame(columns=REQUIRED_COLS)
+        return pd.read_parquet(path_or_file)
+    except Exception:
+        return pd.read_csv(path_or_file, compression="infer")
 
-# Cache index and metadata
+# --------- Artifacts I/O (from pipeline.py output) ----------
+def artifacts_exist(dirpath: str = "artifacts") -> bool:
+    return (
+        os.path.exists(os.path.join(dirpath, "index.faiss")) and
+        os.path.exists(os.path.join(dirpath, "metas.json"))
+    )
+
+def load_artifacts(dirpath: str = "artifacts") -> Tuple[faiss.Index, List[Dict[str, Any]]]:
+    idx = faiss.read_index(os.path.join(dirpath, "index.faiss"))
+    with open(os.path.join(dirpath, "metas.json"), "r", encoding="utf-8") as f:
+        metas = json.load(f)
+    return idx, metas
+
+def save_uploaded_artifacts(index_file, metas_file, dirpath: str = "artifacts") -> Tuple[bool, str]:
+    """Allow users to upload index.faiss & metas.json from pipeline and use immediately."""
+    try:
+        os.makedirs(dirpath, exist_ok=True)
+        if index_file is not None:
+            with open(os.path.join(dirpath, "index.faiss"), "wb") as f:
+                f.write(index_file.read())
+        if metas_file is not None:
+            metas_bytes = metas_file.read()
+            # Try to parse to ensure it's valid JSON
+            json.loads(metas_bytes.decode("utf-8"))
+            with open(os.path.join(dirpath, "metas.json"), "wb") as f:
+                f.write(metas_bytes)
+        return True, "Uploaded artifacts saved."
+    except Exception as e:
+        return False, f"Failed to save artifacts: {e}"
+
+# Cache index and metadata (build on-the-fly)
 @st.cache_resource(show_spinner=False)
 def build_index(df: pd.DataFrame,
                 text_cols=("title","brand","price","features","description"),
@@ -275,7 +292,6 @@ def _answer_with_openai(query: str, snippets: List[Dict[str,Any]]) -> str:
         model_name = (
             os.getenv("OPENAI_MODEL")
             or (st.secrets.get("OPENAI_MODEL") if "OPENAI_MODEL" in st.secrets else "gpt-4o-mini")
-            or (st.secrets.get("OPENAI_MODEL") if "OPENAI_MODEL" in st.secrets else None)
             or st.session_state.get("OPENAI_MODEL_BOX")
             or "gpt-4o-mini"
         )
@@ -283,6 +299,7 @@ def _answer_with_openai(query: str, snippets: List[Dict[str,Any]]) -> str:
             {"role":"system","content":"You are a helpful e-commerce multimodal assistant. Use retrieved facts faithfully. Answer in the user's language."},
             {"role":"user","content": f"Question:\n{query}\n\nRetrieved Context:\n{ctx}"}
         ]
+        # support both old/new openai python client namespaces
         resp = client.chat_completions.create(model=model_name, messages=msgs, temperature=0.2) \
             if hasattr(client, "chat_completions") else \
             client.chat.completions.create(model=model_name, messages=msgs, temperature=0.2)
@@ -298,6 +315,18 @@ st.sidebar.header("Settings")
 limit = st.sidebar.number_input("Number of samples to index", 50, MAX_ROWS, 2000, step=50)
 topk = st.sidebar.slider("Top-K results", 1, 10, 5)
 device = st.sidebar.selectbox("Embedding Device", ["auto","cpu"], index=0)
+
+# --- Pipeline integration: load prebuilt artifacts ---
+st.sidebar.subheader("Index Source")
+use_prebuilt = st.sidebar.checkbox("Use prebuilt artifacts (artifacts/index.faiss + metas.json)", value=True)
+
+if use_prebuilt:
+    st.sidebar.caption("If artifacts are not in repo, upload them below.")
+    up_idx = st.sidebar.file_uploader("Upload index.faiss", type=["faiss"], accept_multiple_files=False)
+    up_meta = st.sidebar.file_uploader("Upload metas.json", type=["json"], accept_multiple_files=False)
+    if st.sidebar.button("Save uploaded artifacts"):
+        ok, msg = save_uploaded_artifacts(up_idx, up_meta, dirpath="artifacts")
+        (st.sidebar.success if ok else st.sidebar.error)(msg)
 
 st.sidebar.subheader("OpenAI (optional)")
 openai_key_input = st.sidebar.text_input("OPENAI_API_KEY", type="password", value=os.getenv("OPENAI_API_KEY",""))
@@ -317,74 +346,61 @@ if c2.button("Compare: Echo Dot vs Nest Mini"):
 if c3.button("Find similar to my photo"):
     st.session_state["qtext"] = "Identify this product and list similar alternatives."
 
-# --- Load data from bundled parquet file (with safe column sanitization) ---
-def _sanitize_columns(df):
-    # 1) 컬럼명을 문자열로 평탄화
-    def _to_str(c):
-        if isinstance(c, tuple):
-            return "_".join(map(str, c)).strip()
-        return str(c).strip()
+# ===== Load/Build Index =====
+index_loaded = False
+if use_prebuilt and artifacts_exist("artifacts"):
+    try:
+        index, metas = load_artifacts("artifacts")
+        st.session_state["INDEX"] = index
+        st.session_state["METAS"] = metas
+        index_loaded = True
+        st.success(f"Loaded prebuilt index: {len(metas)} documents")
+    except Exception as e:
+        st.error(f"Failed to load artifacts: {e}")
 
-    cols = [_to_str(c) for c in df.columns]
+# Fallback: build from bundled dataset or upload
+uploaded_df = None
+if not index_loaded:
+    st.info("No prebuilt artifacts loaded. You can upload a dataset to build an index here.")
+    uf = st.file_uploader(
+        "Upload dataset (.parquet / .csv / .csv.gz). Columns auto-mapped to: "
+        "title, brand, price, features, description, image_url",
+        type=["parquet", "csv", "gz"]
+    )
+    if uf:
+        try:
+            uploaded_df = read_any(uf)
+            uploaded_df = coerce_schema(uploaded_df)
+            st.success(f"Loaded {len(uploaded_df):,} rows. Columns: {list(uploaded_df.columns)}")
+            st.dataframe(uploaded_df.head(5))
+        except Exception as e:
+            st.error(f"Failed to read/parse file: {e}")
 
-    # 2) Unnamed, 빈 문자열 처리
-    cols = [("col" if (c == "" or c.lower().startswith("unnamed")) else c) for c in cols]
-
-    # 3) 중복 컬럼명 뒤에 _2, _3 … 접미사 부여
-    seen, unique = {}, []
-    for c in cols:
-        if c in seen:
-            seen[c] += 1
-            unique.append(f"{c}_{seen[c]}")
+    build = st.button("🔨 Build / Reset Index", type="primary")
+    if build:
+        if uploaded_df is None or uploaded_df.empty:
+            st.error("Please upload a dataset first.")
         else:
-            seen[c] = 0
-            unique.append(c)
-    df.columns = unique
-    return df
-
-uploaded_df = load_default_dataset()
-uploaded_df = _sanitize_columns(uploaded_df)
-
-st.success(
-    f"Loaded {len(uploaded_df):,} rows from bundled dataset. "
-    f"Columns: {list(uploaded_df.columns)}"
-)
-st.dataframe(uploaded_df.head(5))
-
-
-# --- Build index ---
-build = st.button("🔨 Build / Reset Index", type="primary")
-if build:
-    if uploaded_df.empty:
-        st.error("Bundled dataset is empty.")
-    else:
-        with st.spinner("Building index... (creating CLIP embeddings)"):
-            index, metas = build_index(
-                uploaded_df,
-                limit=limit,
-                device=None if device == "auto" else "cpu",
-            )
-            st.session_state["INDEX"] = index
-            st.session_state["METAS"] = metas
-        st.success(f"Index built: {len(metas)} documents")
-
+            with st.spinner("Building index... (creating CLIP embeddings)"):
+                index, metas = build_index(uploaded_df, limit=limit,
+                                           device=None if device=="auto" else "cpu")
+                st.session_state["INDEX"] = index
+                st.session_state["METAS"] = metas
+            st.success(f"Index built: {len(metas)} documents")
+            index_loaded = True
 
 st.divider()
-qcol, icol = st.columns([2, 1])
+qcol, icol = st.columns([2,1])
 with qcol:
-    qtext = st.text_input(
-        "💬 Ask a question",
-        key="qtext",
-        placeholder="e.g., Tell me the specs of Galaxy S21 / Compare Echo Dot vs Nest Mini",
-    )
+    qtext = st.text_input("💬 Ask a question", key="qtext",
+                          placeholder="e.g., Tell me the specs of Galaxy S21 / Compare Echo Dot vs Nest Mini")
 with icol:
-    qimg = st.file_uploader("📷 Upload an image (optional)",
-                            type=["png", "jpg", "jpeg", "webp"])
+    qimg = st.file_uploader("📷 Upload an image (optional)", type=["png","jpg","jpeg","webp"])
 
 send = st.button("Send", type="primary")
 if send:
     if "INDEX" not in st.session_state:
-        st.warning("Please build the index first.")
+        st.warning("Please load artifacts or build the index first.")
     elif not qtext and not qimg:
         st.warning("Enter a question or upload an image.")
     else:
@@ -396,12 +412,11 @@ if send:
             except Exception:
                 st.info("Could not read the uploaded image; continuing with text only.")
 
-        model = load_clip(None if device == "auto" else "cpu")
+        model = load_clip(None if device=="auto" else "cpu")
         qvec = _encode_query(model, qtext or "", img)
         D, I = _search(st.session_state["INDEX"], qvec, k=topk)
 
         snippets = []
-        # NOTE: _search가 (scores, idxes) 2D를 돌려주면 D[0], I[0]으로 바꾸세요.
         for score, idx in zip(D, I):
             if idx == -1:
                 continue
@@ -412,7 +427,7 @@ if send:
                 "brand": meta.get("brand"),
                 "price": meta.get("price"),
                 "features": meta.get("features"),
-                "description": meta.get("description"),
+                "description": meta.get("description")
             })
 
         ans = _answer_with_openai(qtext or "(image query)", snippets)
