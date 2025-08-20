@@ -145,6 +145,18 @@ def read_any_csv(file) -> pd.DataFrame:
         return pd.read_csv(file, compression="infer")
     return pd.read_csv(file)
 
+
+# Load default dataset bundled with the app
+@st.cache_resource(show_spinner=False)
+def load_default_dataset() -> pd.DataFrame:
+    """Load `clean_data.parquet` from the repository and coerce its schema."""
+    try:
+        df = pd.read_parquet("clean_data.parquet")
+        return coerce_schema(df)
+    except Exception as e:
+        st.error(f"Failed to load bundled dataset: {e}")
+        return pd.DataFrame(columns=REQUIRED_COLS)
+
 # Cache index and metadata
 @st.cache_resource(show_spinner=False)
 def build_index(df: pd.DataFrame,
@@ -305,30 +317,23 @@ if c2.button("Compare: Echo Dot vs Nest Mini"):
 if c3.button("Find similar to my photo"):
     st.session_state["qtext"] = "Identify this product and list similar alternatives."
 
-# Load data (upload flow)
-uploaded_df = None
-uf = st.file_uploader(
-    "Upload CSV (supports .csv or .csv.gz) — recommended columns: title, brand, price, features, description, image_url",
-    type=["csv", "gz"]
+# Load data from bundled parquet file
+uploaded_df = load_default_dataset()
+st.success(
+    f"Loaded {len(uploaded_df):,} rows from bundled dataset. Columns: {list(uploaded_df.columns)}"
 )
-if uf:
-    try:
-        uploaded_df = read_any_csv(uf)
-        uploaded_df = coerce_schema(uploaded_df)
-        st.success(f"Loaded {len(uploaded_df):,} rows. Columns: {list(uploaded_df.columns)}")
-        st.dataframe(uploaded_df.head(5))
-    except Exception as e:
-        st.error(f"Failed to read file: {e}")
+st.dataframe(uploaded_df.head(5))
 
 # Build index
 build = st.button("🔨 Build / Reset Index", type="primary")
 if build:
-    if uploaded_df is None or uploaded_df.empty:
-        st.error("Please upload a CSV file first.")
+  if uploaded_df.empty:
+        st.error("Bundled dataset is empty.")
     else:
         with st.spinner("Building index... (creating CLIP embeddings)"):
-            index, metas = build_index(uploaded_df, limit=limit,
-                                       device=None if device=="auto" else "cpu")
+          index, metas = build_index(
+                uploaded_df, limit=limit, device=None if device == "auto" else "cpu"
+            )
             st.session_state["INDEX"] = index
             st.session_state["METAS"] = metas
         st.success(f"Index built: {len(metas)} documents")
