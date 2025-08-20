@@ -334,8 +334,8 @@ if build:
           index, metas = build_index(
                 uploaded_df, limit=limit, device=None if device == "auto" else "cpu"
             )
-            st.session_state["INDEX"] = index
-            st.session_state["METAS"] = metas
+        st.session_state["INDEX"] = index
+        st.session_state["METAS"] = metas
         st.success(f"Index built: {len(metas)} documents")
 
 st.divider()
