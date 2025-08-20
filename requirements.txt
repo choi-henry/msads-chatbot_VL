@@ -7,3 +7,5 @@ torch>=2.2
 torchvision>=0.17
 sentence-transformers>=3.0
 requests
+pyarrow
+faiss-cpu
