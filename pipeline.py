@@ -2,7 +2,7 @@
 # Input : clean_data.parquet (or clean_data.csv/.csv.gz)
 # Output: artifacts/index.faiss, artifacts/metas.json, artifacts/manifest.json
 
-import os, io, re, json, base64, hashlib
+import os, re, json, hashlib
 from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
 
@@ -11,8 +11,6 @@ import pandas as pd
 import faiss                                  # pip install faiss-cpu
 from sentence_transformers import SentenceTransformer
 
-REQUEST_TIMEOUT = 7
-
 # ====== Models (midterm-style selector) ======
 MODELS = {
     "2": {"model_name": "sentence-transformers/paraphrase-MiniLM-L6-v2", "model_type": "encoder-only"},
@@ -20,9 +18,10 @@ MODELS = {
 DEFAULT_MODEL_KEY = "2"  # MiniLM
 
 # ====== Canonical schema & alias ======
-CANON = ["title", "price", "features", "description", "image_url"]
+CANON = ["title", "price", "features", "description", "image_url", "brand"]
 ALIASES = {
     "product_title":"title","name":"title","title":"title",
+    "brand_name":"brand","brand":"brand",
     "price_usd":"price","list_price":"price","current_price":"price","sale_price":"price","amount":"price","price":"price",
     "feature":"features","features":"features",
     "product_description":"description","short_description":"description","long_description":"description","text":"description","description":"description",
@@ -34,12 +33,21 @@ ALIASES = {
 }
 URL_RE = re.compile(r"https?://[^\s|,;]+", re.IGNORECASE)
 
-
-def _first_url(s: str) -> str:
-    if not isinstance(s, str): return ""
+def _first_url(s: Any) -> str:
+    s = "" if s is None else str(s)
     m = URL_RE.search(s)
     return m.group(0) if m else ""
 
+def _to_str(x: Any) -> str:
+    # JSON-safe 문자열화 (Series/ndarray/list 모두 대응)
+    try:
+        if x is None:
+            return ""
+        if isinstance(x, (list, tuple, np.ndarray)):
+            return " ; ".join([_to_str(xx) for xx in x])
+        return str(x)
+    except Exception:
+        return ""
 
 def coerce_schema(df: pd.DataFrame) -> pd.DataFrame:
     # rename aliases
@@ -57,35 +65,25 @@ def coerce_schema(df: pd.DataFrame) -> pd.DataFrame:
         def _merge(row):
             parts = []
             for c in join_cols:
-                v = row.get(c, "")
-                if isinstance(v, (list, tuple)):
-                    v = " ; ".join([str(x) for x in v if str(x).strip()])
-                v = str(v).strip()
-                if v and v.lower() not in ("nan","none","null"):
-                    parts.append(v)
-            return " ; ".join(parts)
+                parts.append(_to_str(row.get(c, "")))
+            return " ; ".join([p for p in parts if p and p.lower() not in ("nan","none","null")])
         df["features"] = df.apply(_merge, axis=1)
 
-    # clean description / image_url
-    if "description" in df.columns:
-        df["description"] = df["description"].fillna("").astype(str)
-    if "image_url" in df.columns:
-        df["image_url"] = df["image_url"].astype(str).apply(_first_url)
-
-    # fill types
-    for c in CANON:
+    # clean description / image_url / brand / title / price
+    for c in ["title","brand","price","features","description"]:
         if c in df.columns:
-            df[c] = df[c].fillna("").astype(str)
+            df[c] = df[c].map(_to_str)
+    if "image_url" in df.columns:
+        df["image_url"] = df["image_url"].map(_first_url)
 
     # drop rows with no text signal
     text_cols = [c for c in ["title","description","features","brand","price"] if c in df.columns]
     if text_cols:
         def _has_text(row):
-            return any(str(row.get(c,"")).strip() for c in text_cols)
+            return any(_to_str(row.get(c,"")).strip() for c in text_cols)
         df = df[df.apply(_has_text, axis=1)].copy()
 
     return df
-
 
 def read_any(path: str) -> pd.DataFrame:
     if path.endswith(".parquet"):
@@ -98,19 +96,17 @@ def read_any(path: str) -> pd.DataFrame:
     except Exception:
         return pd.read_csv(path, compression="infer")
 
-
 def _fingerprint_df(df: pd.DataFrame, cols: List[str]) -> str:
-    # small sample to hash (fast & stable)
-    sample = df[cols].head(200).to_csv(index=False)
+    # 작은 샘플을 문자열로 해시
+    safe_cols = [c for c in cols if c in df.columns]
+    sample = df[safe_cols].head(200).astype(str).to_csv(index=False)
     h = hashlib.sha1()
     h.update(sample.encode("utf-8"))
     return h.hexdigest()
 
-
 def load_encoder(model_key: str = DEFAULT_MODEL_KEY, device: Optional[str] = None) -> SentenceTransformer:
     name = MODELS[model_key]["model_name"]
     return SentenceTransformer(name, device=device)
-
 
 def embed_text_rows(
     df: pd.DataFrame,
@@ -123,18 +119,18 @@ def embed_text_rows(
 
     texts, metas = [], []
     for _, row in df.iterrows():
-        parts = [str(row[c]) for c in text_cols if c in df.columns and str(row.get(c,"")).strip()]
+        parts = [_to_str(row.get(c, "")) for c in text_cols if _to_str(row.get(c, "")).strip()]
         text = " | ".join(parts) if parts else ""
         if not text:
             continue
         texts.append(text)
         metas.append({
-            "title": row.get("title",""),
-            "brand": row.get("brand",""),
-            "price": row.get("price",""),
-            "features": row.get("features",""),
-            "description": row.get("description",""),
-            "image_url": row.get("image_url",""),
+            "title": _to_str(row.get("title","")),
+            "brand": _to_str(row.get("brand","")),
+            "price": _to_str(row.get("price","")),
+            "features": _to_str(row.get("features","")),
+            "description": _to_str(row.get("description","")),
+            "image_url": _to_str(row.get("image_url","")),
         })
 
     if not texts:
@@ -144,21 +140,19 @@ def embed_text_rows(
     X = np.asarray(X, dtype="float32")
     return X, metas
 
-
 def build_faiss_index(X: np.ndarray) -> faiss.IndexFlatIP:
     d = X.shape[1]
     idx = faiss.IndexFlatIP(d)
-    idx.add(X)
+    idx.add(X.astype("float32"))
     return idx
-
 
 def save_artifacts(index: faiss.Index, metas: List[Dict[str, Any]], outdir: str, manifest: Dict[str, Any]):
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
     faiss.write_index(index, str(out / "index.faiss"))
-    (out / "metas.json").write_text(json.dumps(metas, ensure_ascii=False), encoding="utf-8")
-    (out / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
-
+    # 안전 저장: default=str
+    (out / "metas.json").write_text(json.dumps(metas, ensure_ascii=False, default=str), encoding="utf-8")
+    (out / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, default=str), encoding="utf-8")
 
 def load_artifacts(outdir: str) -> Tuple[faiss.Index, List[Dict[str, Any]], Dict[str, Any]]:
     out = Path(outdir)
@@ -166,7 +160,6 @@ def load_artifacts(outdir: str) -> Tuple[faiss.Index, List[Dict[str, Any]], Dict
     metas = json.loads((out / "metas.json").read_text(encoding="utf-8"))
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8")) if (out / "manifest.json").exists() else {}
     return idx, metas, manifest
-
 
 def build_or_load_index(
     df: pd.DataFrame,
@@ -188,12 +181,15 @@ def build_or_load_index(
 
     fp = _fingerprint_df(df, text_cols)
     model_name = MODELS[model_key]["model_name"]
-    manifest_new = {"fingerprint": fp, "model": model_name, "limit": limit}
+    manifest_new = {"fingerprint": fp, "model": model_name, "limit": int(limit) if limit else None}
 
     # Reuse if possible
     try:
         idx_old, metas_old, man_old = load_artifacts(outdir)
-        if not force_rebuild and man_old.get("fingerprint") == fp and man_old.get("model") == model_name and man_old.get("limit") == limit:
+        if (not force_rebuild
+            and man_old.get("fingerprint") == fp
+            and man_old.get("model") == model_name
+            and (man_old.get("limit") == (int(limit) if limit else None))):
             return idx_old, metas_old
     except Exception:
         pass
@@ -205,8 +201,7 @@ def build_or_load_index(
     save_artifacts(index, metas, outdir, manifest_new)
     return index, metas
 
-
-# ---- Helpers for querying from the app ----
+# ---- Query helper for the app ----
 def encode_query(text: str, device: Optional[str] = None, model_key: str = DEFAULT_MODEL_KEY) -> np.ndarray:
     encoder = load_encoder(model_key, device=device)
     q = encoder.encode([text], normalize_embeddings=True)
