@@ -27,6 +27,7 @@ try:
         build_or_load_index,            # (df, device, use_images, limit, outdir, ...)
         artifacts_exist, load_artifacts,# artifacts I/O
         coerce_schema, read_any         # data utilities
+        encode_query,
     )
 except Exception as e:
     st.error(f"Failed to import pipeline: {e}")
