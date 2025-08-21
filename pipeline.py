@@ -39,6 +39,14 @@ ALIASES = {
 }
 URL_RE = re.compile(r"https?://[^\s|,;]+", re.IGNORECASE)
 
+__all__ = [
+    "coerce_schema", "read_any",
+    "build_or_load_index", "load_artifacts",
+    "artifacts_exist", "save_uploaded_artifacts",
+    "encode_query",
+]
+
+# ---------- Utils ----------
 def _first_url(s: str) -> str:
     if not isinstance(s, str): return ""
     m = URL_RE.search(s)
@@ -111,6 +119,7 @@ def _download_image(url: str) -> Optional[bytes]:
     except Exception:
         return None
 
+# ---------- Embedding & Index ----------
 def embed_rows(
     df: pd.DataFrame,
     model: SentenceTransformer,
@@ -186,6 +195,31 @@ def load_artifacts(outdir: str) -> Tuple[faiss.Index, List[Dict[str, Any]], Dict
     manifest = json.loads((out/"manifest.json").read_text(encoding="utf-8")) if (out/"manifest.json").exists() else {}
     return idx, metas, manifest
 
+# ---------- NEW: existence & upload helpers ----------
+def artifacts_exist(dirpath: str = "artifacts") -> bool:
+    return (
+        os.path.exists(os.path.join(dirpath, "index.faiss")) and
+        os.path.exists(os.path.join(dirpath, "metas.json"))
+    )
+
+def save_uploaded_artifacts(index_file, metas_file, dirpath: str = "artifacts") -> Tuple[bool, str]:
+    """Allow users to upload index.faiss & metas.json and use immediately."""
+    try:
+        os.makedirs(dirpath, exist_ok=True)
+        if index_file is not None:
+            with open(os.path.join(dirpath, "index.faiss"), "wb") as f:
+                f.write(index_file.read())
+        if metas_file is not None:
+            metas_bytes = metas_file.read()
+            # sanity check JSON
+            json.loads(metas_bytes.decode("utf-8"))
+            with open(os.path.join(dirpath, "metas.json"), "wb") as f:
+                f.write(metas_bytes)
+        return True, "Uploaded artifacts saved."
+    except Exception as e:
+        return False, f"Failed to save artifacts: {e}"
+
+# ---------- Build or reuse ----------
 def build_or_load_index(
     df: pd.DataFrame,
     device: Optional[str] = None,
