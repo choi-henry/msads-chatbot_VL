@@ -1,4 +1,4 @@
-# pipeline.py — Build & use a multimodal FAISS index (CLIP text+image avg)
+# pipeline.py — Build & use a FAISS index with CLIP (text & optional image)
 # Input : clean_data.parquet (or clean_data.csv/.csv.gz)
 # Output: artifacts/index.faiss, artifacts/metas.json, artifacts/manifest.json
 
@@ -8,9 +8,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from PIL import Image, UnidentifiedImageError
-
-import faiss                                   # pip install faiss-cpu
+from PIL import Image
+import faiss                                  # pip install faiss-cpu
 from sentence_transformers import SentenceTransformer
 
 try:
@@ -18,12 +17,13 @@ try:
 except Exception:
     requests = None
 
-# --------- Fixed CLIP model (single) ----------
-EMB_MODEL = "clip-ViT-B-32"
-EMB_DIM = 512
 REQUEST_TIMEOUT = 7
 
-# --------- Canonical schema & alias -----------
+# ====== CLIP model (unified) ======
+EMB_MODEL = "clip-ViT-B-32"   # 👈 통일
+EMB_DIM   = 512
+
+# ====== Canonical schema & alias ======
 CANON = ["title", "brand", "price", "features", "description", "image_url"]
 ALIASES = {
     "product_title":"title","name":"title","title":"title",
@@ -39,38 +39,11 @@ ALIASES = {
 }
 URL_RE = re.compile(r"https?://[^\s|,;]+", re.IGNORECASE)
 
-# ----------------- utils -----------------
 def _first_url(s: str) -> str:
     if not isinstance(s, str): return ""
     m = URL_RE.search(s)
     return m.group(0) if m else ""
 
-def _download_image(url: str) -> Optional[bytes]:
-    if not url or not requests:
-        return None
-    try:
-        r = requests.get(url, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        return r.content
-    except Exception:
-        return None
-
-def read_any(path: str) -> pd.DataFrame:
-    if path.endswith(".parquet"):
-        return pd.read_parquet(path)
-    if path.endswith(".csv") or path.endswith(".gz"):
-        return pd.read_csv(path, compression="infer")
-    try:
-        return pd.read_parquet(path)
-    except Exception:
-        return pd.read_csv(path, compression="infer")
-
-def _fingerprint_df(df: pd.DataFrame, cols: List[str]) -> str:
-    sample = df[cols].head(200).to_csv(index=False)
-    h = hashlib.sha1(); h.update(sample.encode("utf-8"))
-    return h.hexdigest()
-
-# ------------- schema coercion -------------
 def coerce_schema(df: pd.DataFrame) -> pd.DataFrame:
     # rename aliases
     plan = {}
@@ -81,7 +54,7 @@ def coerce_schema(df: pd.DataFrame) -> pd.DataFrame:
     if plan:
         df = df.rename(columns=plan)
 
-    # merge feature-like columns
+    # merge several feature-like cols
     join_cols = [c for c in ["features","product specification","technical details","variants","product dimensions","shipping weight"] if c in df.columns]
     if join_cols:
         def _merge(row):
@@ -96,17 +69,9 @@ def coerce_schema(df: pd.DataFrame) -> pd.DataFrame:
             return " ; ".join(parts)
         df["features"] = df.apply(_merge, axis=1)
 
-    # prefer description + text_blob
+    # clean description / image_url
     if "description" in df.columns:
         df["description"] = df["description"].fillna("").astype(str)
-    if "text_blob" in df.columns:
-        if "description" in df.columns:
-            df["description"] = (df["description"].fillna("").astype(str) + " " +
-                                 df["text_blob"].fillna("").astype(str))
-        else:
-            df = df.rename(columns={"text_blob":"description"})
-
-    # clean image_url
     if "image_url" in df.columns:
         df["image_url"] = df["image_url"].astype(str).apply(_first_url)
 
@@ -124,37 +89,48 @@ def coerce_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-# ------------- encoder (CLIP) -------------
+def read_any(path: str) -> pd.DataFrame:
+    if path.endswith(".parquet"): return pd.read_parquet(path)
+    if path.endswith(".csv") or path.endswith(".gz"): return pd.read_csv(path, compression="infer")
+    try: return pd.read_parquet(path)
+    except Exception: return pd.read_csv(path, compression="infer")
+
+def _fingerprint_df(df: pd.DataFrame, cols: List[str]) -> str:
+    sample = df[cols].head(200).to_csv(index=False)
+    h = hashlib.sha1(); h.update(sample.encode("utf-8"))
+    return h.hexdigest()
+
 def load_encoder(device: Optional[str] = None) -> SentenceTransformer:
     return SentenceTransformer(EMB_MODEL, device=device)
 
-# ------------- embedding (text + optional image avg) -------------
+def _download_image(url: str) -> Optional[bytes]:
+    if not (requests and url): return None
+    try:
+        r = requests.get(url, timeout=REQUEST_TIMEOUT); r.raise_for_status()
+        return r.content
+    except Exception:
+        return None
+
 def embed_rows(
     df: pd.DataFrame,
     model: SentenceTransformer,
+    use_images: bool = True,
     limit: Optional[int] = None,
 ) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
-    if limit:
-        df = df.head(limit)
+    if limit: df = df.head(limit)
 
     text_cols = [c for c in ["title","brand","price","features","description"] if c in df.columns]
-
-    texts: List[str] = []
-    rows: List[pd.Series] = []
+    texts, rows = [], []
     for _, row in df.iterrows():
         parts = [str(row[c]) for c in text_cols if str(row.get(c,"")).strip()]
         texts.append(" | ".join(parts) if parts else "")
         rows.append(row)
-
     if not texts:
         raise ValueError("No usable text to embed.")
 
-    # batch text encode
-    tvecs = model.encode(texts, normalize_embeddings=True, batch_size=64).astype("float32")
+    tv = model.encode(texts, normalize_embeddings=True, batch_size=64).astype("float32")
 
-    metas: List[Dict[str, Any]] = []
-    vecs: List[np.ndarray] = []
-
+    metas, vecs = [], []
     for i, row in enumerate(rows):
         meta = {
             "title": row.get("title",""),
@@ -164,40 +140,37 @@ def embed_rows(
             "description": row.get("description",""),
             "image_url": row.get("image_url",""),
         }
-        v = tvecs[i:i+1]  # (1, EMB_DIM)
+        vec = tv[i:i+1]
 
-        # image avg if available
-        b64 = str(row.get("image_b64","")).strip()
-        raw = None
-        if b64:
-            try:
-                raw = base64.b64decode(b64)
-            except Exception:
-                raw = None
-        elif meta["image_url"]:
-            raw = _download_image(meta["image_url"])
+        if use_images:
+            # image_b64 우선, 없으면 image_url
+            b64 = str(row.get("image_b64","")).strip()
+            raw = None
+            if b64:
+                try: raw = base64.b64decode(b64)
+                except Exception: raw = None
+            elif meta["image_url"]:
+                raw = _download_image(meta["image_url"])
 
-        if raw:
-            try:
-                pil = Image.open(io.BytesIO(raw)).convert("RGB")
-                ivec = model.encode([pil], normalize_embeddings=True).astype("float32")
-                v = (v + ivec) / 2.0
-                meta["_image_b64"] = base64.b64encode(raw).decode("utf-8")
-            except (UnidentifiedImageError, Exception):
-                pass
+            if raw:
+                try:
+                    pil = Image.open(io.BytesIO(raw)).convert("RGB")
+                    iv = model.encode([pil], normalize_embeddings=True).astype("float32")
+                    meta["_image_b64"] = base64.b64encode(raw).decode("utf-8")
+                    vec = (vec + iv) / 2.0
+                except Exception:
+                    pass
 
-        metas.append(meta)
-        vecs.append(v[0])
+        metas.append(meta); vecs.append(vec[0])
 
     X = np.vstack(vecs).astype("float32")
-    assert X.shape[1] == EMB_DIM, f"Embedding dim mismatch: {X.shape[1]} != {EMB_DIM}"
+    assert X.shape[1] == EMB_DIM, f"Expected {EMB_DIM}D, got {X.shape[1]}"
     return X, metas
 
-# ------------- FAISS I/O -------------
 def build_faiss_index(X: np.ndarray) -> faiss.IndexFlatIP:
-    assert X.shape[1] == EMB_DIM
+    assert X.shape[1] == EMB_DIM, f"Index dim must be {EMB_DIM}"
     idx = faiss.IndexFlatIP(EMB_DIM)
-    idx.add(X.astype("float32"))
+    idx.add(X)
     return idx
 
 def save_artifacts(index: faiss.Index, metas: List[Dict[str, Any]], outdir: str, manifest: Dict[str, Any]):
@@ -213,14 +186,13 @@ def load_artifacts(outdir: str) -> Tuple[faiss.Index, List[Dict[str, Any]], Dict
     manifest = json.loads((out/"manifest.json").read_text(encoding="utf-8")) if (out/"manifest.json").exists() else {}
     return idx, metas, manifest
 
-# ------------- Build or reuse -------------
 def build_or_load_index(
     df: pd.DataFrame,
     device: Optional[str] = None,
-    use_images: bool = True,          # kept for signature; images already handled above
+    use_images: bool = True,
     limit: Optional[int] = None,
     outdir: str = "artifacts",
-    batch_size: int = 64,             # not used (SentenceTransformer handles internally)
+    batch_size: int = 64,     # kept for signature
     force_rebuild: bool = False,
 ) -> Tuple[faiss.Index, List[Dict[str, Any]]]:
     text_cols = [c for c in ["title","brand","price","features","description"] if c in df.columns]
@@ -228,38 +200,37 @@ def build_or_load_index(
         raise ValueError("No text columns found to build index.")
 
     fp = _fingerprint_df(df, text_cols)
-    manifest_new = {"fingerprint": fp, "model": EMB_MODEL, "emb_dim": EMB_DIM, "limit": limit}
+    manifest_new = {"fingerprint": fp, "model": EMB_MODEL, "dim": EMB_DIM, "limit": limit, "use_images": use_images}
 
+    # Reuse if possible
     try:
         idx_old, metas_old, man_old = load_artifacts(outdir)
         if (not force_rebuild and
             man_old.get("fingerprint") == fp and
             man_old.get("model") == EMB_MODEL and
-            int(man_old.get("emb_dim", 0)) == EMB_DIM and
-            man_old.get("limit") == limit):
+            man_old.get("dim") == EMB_DIM and
+            man_old.get("limit") == limit and
+            man_old.get("use_images") == use_images):
             return idx_old, metas_old
     except Exception:
         pass
 
     encoder = load_encoder(device=device)
-    X, metas = embed_rows(df, encoder, limit=limit)
+    X, metas = embed_rows(df, encoder, use_images=use_images, limit=limit)
     index = build_faiss_index(X)
     save_artifacts(index, metas, outdir, manifest_new)
     return index, metas
 
-# ------------- Query encoder (CLIP) -------------
+# ---- Query helper (text and optional image path) ----
 def encode_query(text: str = "", image_path: Optional[str] = None, device: Optional[str] = None) -> np.ndarray:
-    enc = load_encoder(device=device)
-    tv = enc.encode([text], normalize_embeddings=True).astype("float32") if text else None
+    model = load_encoder(device=device)
+    tv = model.encode([text], normalize_embeddings=True).astype("float32") if text else None
     iv = None
     if image_path:
         with open(image_path, "rb") as f:
             pil = Image.open(io.BytesIO(f.read())).convert("RGB")
-        iv = enc.encode([pil], normalize_embeddings=True).astype("float32")
+        iv = model.encode([pil], normalize_embeddings=True).astype("float32")
     if tv is not None and iv is not None:
-        q = ((tv + iv) / 2.0).astype("float32")
-    else:
-        q = (tv if tv is not None else iv).astype("float32")
-    assert q.shape[1] == EMB_DIM, f"Query dim mismatch: {q.shape[1]} != {EMB_DIM}"
-    return q
+        return ((tv + iv) / 2.0).astype("float32")
+    return (tv if tv is not None else iv).astype("float32")
 
